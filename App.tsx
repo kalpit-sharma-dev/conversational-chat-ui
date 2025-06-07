@@ -12,6 +12,7 @@ import {
   TouchableOpacity,
   Alert,
   StatusBar,
+  Animated,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import Constants from 'expo-constants';
@@ -25,6 +26,7 @@ interface Message {
   isStreaming?: boolean;
   error?: boolean;
   timestamp: Date;
+  type?: 'text' | 'voice';
 }
 
 type AuthResponse = {
@@ -34,6 +36,7 @@ type AuthResponse = {
 };
 
 type Theme = 'light' | 'dark';
+type ConversationMode = 'text' | 'voice_record' | 'voice_live';
 
 const API_BASE_URL = 'http://192.168.0.186:8080';
 const TOKEN_KEY = 'auth_token';
@@ -47,6 +50,7 @@ export default function App() {
       role: 'assistant',
       content: 'Hi! I\'m your AI banking assistant. How can I help you today?',
       timestamp: new Date(),
+      type: 'text',
     },
   ]);
   const [input, setInput] = useState('');
@@ -54,11 +58,23 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [theme, setTheme] = useState<Theme>('dark');
+  const [conversationMode, setConversationMode] = useState<ConversationMode>('text');
+  
+  // Voice states
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [voiceLevel, setVoiceLevel] = useState(0);
   
   const flatListRef = useRef<FlatList>(null);
   const eventSourceRef = useRef<RNEventSource | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const currentMessageRef = useRef<string>('');
+  
+  // Voice refs
+  const recordingRef = useRef<any>(null);
+  const audioRef = useRef<any>(null);
+  const animationRef = useRef(new Animated.Value(0)).current;
   
   // Authentication state
   const tokenRef = useRef<string | null>(null);
@@ -84,6 +100,31 @@ export default function App() {
       }, 100);
     }
   }, [messages]);
+
+  // Voice level animation
+  useEffect(() => {
+    if (isRecording || isListening) {
+      const animate = () => {
+        Animated.sequence([
+          Animated.timing(animationRef, {
+            toValue: 1,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+          Animated.timing(animationRef, {
+            toValue: 0,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+        ]).start(() => {
+          if (isRecording || isListening) {
+            animate();
+          }
+        });
+      };
+      animate();
+    }
+  }, [isRecording, isListening]);
 
   const initializeAuth = async () => {
     try {
@@ -211,8 +252,9 @@ export default function App() {
     }
   };
 
-  const sendMessage = async () => {
-    if (!input.trim() || loading || !isAuthenticated) return;
+  const sendMessage = async (messageText?: string, messageType: 'text' | 'voice' = 'text') => {
+    const textToSend = messageText || input.trim();
+    if (!textToSend || loading || !isAuthenticated) return;
 
     const token = tokenRef.current;
     const sessionId = sessionIdRef.current;
@@ -224,11 +266,7 @@ export default function App() {
 
     await checkTokenExpiry();
 
-    // Close any existing EventSource or XHR
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+    // Close any existing requests
     if (xhrRef.current) {
       xhrRef.current.abort();
       xhrRef.current = null;
@@ -237,13 +275,13 @@ export default function App() {
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: input.trim(),
+      content: textToSend,
       timestamp: new Date(),
+      type: messageType,
     };
 
-    const currentInput = input.trim();
     setMessages((prev) => [...prev, userMessage]);
-    setInput('');
+    if (!messageText) setInput('');
     setLoading(true);
 
     const assistantMessageId = Date.now().toString() + '-ai';
@@ -258,11 +296,12 @@ export default function App() {
         content: '',
         isStreaming: true,
         timestamp: new Date(),
+        type: 'text',
       },
     ]);
 
     try {
-      await startSSEStream(currentInput, assistantMessageId);
+      await startSSEStream(textToSend, assistantMessageId);
     } catch (error) {
       console.error('Error in sendMessage:', error);
       setMessages(prev => {
@@ -294,9 +333,8 @@ export default function App() {
 
         console.log('Starting SSE stream for message:', message);
         
-        // Create XHR request
         const xhr = new XMLHttpRequest();
-        xhrRef.current = xhr; // Store reference for stopping
+        xhrRef.current = xhr;
         const url = `${API_BASE_URL}/chat?session_id=${sessionId}`;
         
         xhr.open('POST', url, true);
@@ -305,7 +343,6 @@ export default function App() {
         xhr.setRequestHeader('Accept', 'text/event-stream');
         xhr.responseType = 'text';
 
-        // Handle response chunks
         let buffer = '';
         let isProcessing = false;
         
@@ -313,18 +350,14 @@ export default function App() {
           const newData = xhr.responseText.slice(buffer.length);
           buffer = xhr.responseText;
 
-          console.log('Received new data:', newData);
-
-          // Process each line
           const lines = newData.split('\n');
           for (const line of lines) {
             if (line.startsWith('data: ')) {
               const data = line.slice(6);
-              console.log('Processing SSE data:', data);
               
               if (data === '[DONE]') {
                 console.log('Stream completed');
-                xhrRef.current = null; // Clear reference
+                xhrRef.current = null;
                 xhr.abort();
                 setMessages(prev => prev.map(msg => 
                   msg.id === messageId 
@@ -340,22 +373,16 @@ export default function App() {
                 throw new Error(data);
               }
 
-              // Parse the data
               try {
                 const parsed = JSON.parse(data);
-                console.log('Parsed SSE data:', parsed);
 
-                // Handle initial status message
                 if (parsed.status === 'processing') {
-                  console.log('Server is processing the request');
                   isProcessing = true;
                   continue;
                 }
 
-                // Handle Llama response format
                 if (parsed.response !== undefined) {
                   currentMessageRef.current += parsed.response;
-                  console.log('Updated message content:', currentMessageRef.current);
                   setMessages(prev => prev.map(msg => 
                     msg.id === messageId 
                       ? { ...msg, content: currentMessageRef.current, isStreaming: true } 
@@ -369,12 +396,10 @@ export default function App() {
           }
         };
 
-        // Handle completion
         xhr.onload = () => {
           console.log('XHR completed with status:', xhr.status);
-          xhrRef.current = null; // Clear reference
+          xhrRef.current = null;
           if (xhr.status === 200) {
-            // Only complete if we've received actual content
             if (currentMessageRef.current) {
               setMessages(prev => prev.map(msg => 
                 msg.id === messageId 
@@ -384,7 +409,6 @@ export default function App() {
               setLoading(false);
               resolve();
             } else if (!isProcessing) {
-              // If we haven't received any content and we're not processing, something went wrong
               const error = new Error('No response content received');
               setMessages(prev => prev.map(msg => 
                 msg.id === messageId 
@@ -416,10 +440,9 @@ export default function App() {
           }
         };
 
-        // Handle errors
         xhr.onerror = () => {
           console.error('XHR error occurred');
-          xhrRef.current = null; // Clear reference
+          xhrRef.current = null;
           const error = new Error('Network error occurred');
           setMessages(prev => prev.map(msg => 
             msg.id === messageId 
@@ -435,10 +458,9 @@ export default function App() {
           reject(error);
         };
 
-        // Handle abort (when user clicks stop)
         xhr.onabort = () => {
           console.log('XHR request was aborted by user');
-          xhrRef.current = null; // Clear reference
+          xhrRef.current = null;
           setMessages(prev => prev.map(msg => 
             msg.id === messageId 
               ? { 
@@ -449,10 +471,9 @@ export default function App() {
               : msg
           ));
           setLoading(false);
-          resolve(); // Resolve the promise on abort
+          resolve();
         };
 
-        // Send the request
         console.log('Sending XHR request');
         xhr.send(JSON.stringify({
           message: message,
@@ -478,17 +499,72 @@ export default function App() {
     });
   };
 
+  // Voice Recording Functions
+  const startRecording = async () => {
+    try {
+      setIsRecording(true);
+      console.log('Starting voice recording...');
+      // TODO: Implement actual voice recording
+      // Example: recordingRef.current = await AudioRecorder.start();
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      setIsRecording(false);
+    }
+  };
+
+  const stopRecording = async () => {
+    try {
+      setIsRecording(false);
+      console.log('Stopping voice recording...');
+      // TODO: Implement actual voice recording stop and processing
+      // Example:
+      // const audioFile = await AudioRecorder.stop();
+      // const transcript = await sendToSTT(audioFile);
+      // sendMessage(transcript, 'voice');
+      
+      // For demo purposes, simulate voice input
+      setTimeout(() => {
+        sendMessage("This is a voice message transcription demo", 'voice');
+      }, 500);
+    } catch (error) {
+      console.error('Error stopping recording:', error);
+    }
+  };
+
+  const toggleLiveVoice = () => {
+    if (conversationMode === 'voice_live') {
+      setConversationMode('text');
+      setIsListening(false);
+      console.log('Live voice mode disabled');
+    } else {
+      setConversationMode('voice_live');
+      setIsListening(true);
+      console.log('Live voice mode enabled');
+      // TODO: Start continuous listening
+    }
+  };
+
+  const handleVoicePress = () => {
+    if (conversationMode === 'voice_record') {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    } else if (conversationMode === 'text') {
+      setConversationMode('voice_record');
+    }
+  };
+
   const stopStreaming = () => {
     console.log('Stopping stream...');
     
-    // Abort the XHR request if it exists
     if (xhrRef.current) {
       console.log('Aborting XHR request');
       xhrRef.current.abort();
       xhrRef.current = null;
     }
     
-    // Close EventSource if it exists (fallback)
     if (eventSourceRef.current) {
       console.log('Closing EventSource');
       eventSourceRef.current.close();
@@ -497,7 +573,6 @@ export default function App() {
     
     setLoading(false);
 
-    // Mark current streaming message as complete
     setMessages(prev => prev.map(msg => 
       msg.isStreaming ? { 
         ...msg, 
@@ -509,7 +584,6 @@ export default function App() {
 
   const clearSession = async () => {
     try {
-      // Close any active streams
       if (xhrRef.current) {
         xhrRef.current.abort();
         xhrRef.current = null;
@@ -534,6 +608,7 @@ export default function App() {
         role: 'assistant',
         content: 'Hi! I\'m your AI banking assistant. How can I help you today?',
         timestamp: new Date(),
+        type: 'text',
       }]);
       
       await authenticate();
@@ -550,6 +625,57 @@ export default function App() {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
+  const renderModeIndicator = () => {
+    const getIndicatorConfig = () => {
+      switch (conversationMode) {
+        case 'voice_record':
+          return {
+            icon: 'mic' as const,
+            text: 'Voice Record',
+            color: '#FF6B35'
+          };
+        case 'voice_live':
+          return {
+            icon: 'radio' as const,
+            text: isListening ? 'Listening...' : 'Live Voice',
+            color: '#10B981'
+          };
+        default:
+          return {
+            icon: 'chatbubble' as const,
+            text: 'Text Mode',
+            color: '#007AFF'
+          };
+      }
+    };
+
+    const config = getIndicatorConfig();
+    
+    return (
+      <View style={[styles.modeIndicator, theme === 'light' && styles.modeIndicatorLight]}>
+        <Ionicons 
+          name={config.icon} 
+          size={16} 
+          color={config.color} 
+        />
+        <Text style={[styles.modeText, { color: config.color }]}>
+          {config.text}
+        </Text>
+        {(isListening || isRecording) && (
+          <Animated.View 
+            style={[
+              styles.pulseDot,
+              {
+                backgroundColor: config.color,
+                opacity: animationRef,
+              }
+            ]} 
+          />
+        )}
+      </View>
+    );
+  };
+
   const renderMessage = ({ item }: { item: Message }) => {
     const isUser = item.role === 'user';
     const messageStyle = isUser ? styles.userMessage : styles.assistantMessage;
@@ -563,6 +689,15 @@ export default function App() {
           messageStyle,
           theme === 'light' && (isUser ? styles.userMessageLight : styles.assistantMessageLight)
         ]}>
+          {item.type === 'voice' && (
+            <View style={styles.voiceIndicator}>
+              <Ionicons 
+                name="mic" 
+                size={14} 
+                color={isUser ? '#ffffff' : (theme === 'light' ? '#007AFF' : '#ffffff')} 
+              />
+            </View>
+          )}
           <Text style={[
             textStyle,
             theme === 'light' && (isUser ? styles.userTextLight : styles.assistantTextLight)
@@ -582,7 +717,7 @@ export default function App() {
 
   if (authLoading) {
     return (
-      <View style={[styles.container, theme === 'light' && styles.containerLight]}>
+      <SafeAreaView style={[styles.container, theme === 'light' && styles.containerLight]}>
         <StatusBar
           barStyle={theme === 'dark' ? 'light-content' : 'dark-content'}
           backgroundColor={theme === 'dark' ? '#000000' : '#ffffff'}
@@ -593,13 +728,13 @@ export default function App() {
             Connecting to server...
           </Text>
         </View>
-      </View>
+      </SafeAreaView>
     );
   }
 
   if (!isAuthenticated) {
     return (
-      <View style={[styles.container, theme === 'light' && styles.containerLight]}>
+      <SafeAreaView style={[styles.container, theme === 'light' && styles.containerLight]}>
         <StatusBar
           barStyle={theme === 'dark' ? 'light-content' : 'dark-content'}
           backgroundColor={theme === 'dark' ? '#000000' : '#ffffff'}
@@ -612,7 +747,7 @@ export default function App() {
             <Text style={styles.retryButtonText}>Retry Connection</Text>
           </TouchableOpacity>
         </View>
-      </View>
+      </SafeAreaView>
     );
   }
 
@@ -646,7 +781,10 @@ export default function App() {
           </View>
         </View>
         
-        {/* Border separator - only at bottom of header */}
+        {/* Mode Indicator */}
+        {renderModeIndicator()}
+        
+        {/* Border separator */}
         <View style={[styles.headerBorder, theme === 'light' && styles.headerBorderLight]} />
       </View>
       
@@ -670,11 +808,85 @@ export default function App() {
         keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
       >
         <View style={[styles.bottomContainer, theme === 'light' && styles.bottomContainerLight]}>
+          {/* Conversation Mode Selector */}
+          <View style={[styles.modeSelector, theme === 'light' && styles.modeSelectorLight]}>
+            <TouchableOpacity 
+              style={[
+                styles.modeButton,
+                conversationMode === 'text' && styles.modeButtonActive,
+                theme === 'light' && styles.modeButtonLight,
+                conversationMode === 'text' && theme === 'light' && styles.modeButtonActiveLight
+              ]}
+              onPress={() => setConversationMode('text')}
+            >
+              <Ionicons 
+                name="chatbubble" 
+                size={18} 
+                color={conversationMode === 'text' 
+                  ? '#007AFF' 
+                  : (theme === 'light' ? '#666' : '#999')
+                } 
+              />
+              <Text style={[
+                styles.modeButtonText,
+                conversationMode === 'text' && styles.modeButtonTextActive,
+                theme === 'light' && styles.modeButtonTextLight
+              ]}>Text</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[
+                styles.modeButton,
+                conversationMode === 'voice_record' && styles.modeButtonActive,
+                theme === 'light' && styles.modeButtonLight,
+                conversationMode === 'voice_record' && theme === 'light' && styles.modeButtonActiveLight
+              ]}
+              onPress={() => setConversationMode('voice_record')}
+            >
+              <Ionicons 
+                name="mic" 
+                size={18} 
+                color={conversationMode === 'voice_record' 
+                  ? '#FF6B35' 
+                  : (theme === 'light' ? '#666' : '#999')
+                } 
+              />
+              <Text style={[
+                styles.modeButtonText,
+                conversationMode === 'voice_record' && styles.modeButtonTextActive,
+                theme === 'light' && styles.modeButtonTextLight
+              ]}>Record</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[
+                styles.modeButton,
+                conversationMode === 'voice_live' && styles.modeButtonActive,
+                theme === 'light' && styles.modeButtonLight,
+                conversationMode === 'voice_live' && theme === 'light' && styles.modeButtonActiveLight
+              ]}
+              onPress={toggleLiveVoice}
+            >
+              <Ionicons 
+                name="radio" 
+                size={18} 
+                color={conversationMode === 'voice_live' 
+                  ? '#10B981' 
+                  : (theme === 'light' ? '#666' : '#999')
+                } 
+              />
+              <Text style={[
+                styles.modeButtonText,
+                conversationMode === 'voice_live' && styles.modeButtonTextActive,
+                theme === 'light' && styles.modeButtonTextLight
+              ]}>Live</Text>
+            </TouchableOpacity>
+          </View>
+
           <View style={[styles.inputContainer, theme === 'light' && styles.inputContainerLight]}>
             <TouchableOpacity 
               style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
               onPress={() => {
-                // TODO: Implement attachment functionality
                 console.log('Attachment pressed');
               }}
             >
@@ -685,55 +897,63 @@ export default function App() {
               />
             </TouchableOpacity>
 
-            <TouchableOpacity 
-              style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
-              onPress={() => {
-                // TODO: Implement emoji picker
-                console.log('Emoji picker pressed');
-              }}
-            >
-              <Ionicons
-                name="happy"
-                size={24}
-                color={theme === 'light' ? '#007AFF' : '#ffffff'}
+            {conversationMode === 'text' && (
+              <TextInput
+                value={input}
+                onChangeText={setInput}
+                placeholder="Ask about your banking needs..."
+                style={[styles.textInput, theme === 'light' && styles.textInputLight]}
+                editable={!loading}
+                returnKeyType="send"
+                onSubmitEditing={() => sendMessage()}
+                multiline={true}
+                maxLength={1000}
+                placeholderTextColor={theme === 'light' ? '#666' : '#999'}
               />
-            </TouchableOpacity>
+            )}
 
-            <TextInput
-              value={input}
-              onChangeText={setInput}
-              placeholder="Ask about your banking needs..."
-              style={[styles.textInput, theme === 'light' && styles.textInputLight]}
-              editable={!loading}
-              returnKeyType="send"
-              onSubmitEditing={sendMessage}
-              multiline={true}
-              maxLength={1000}
-              placeholderTextColor={theme === 'light' ? '#666' : '#999'}
-            />
+            {conversationMode === 'voice_record' && (
+              <View style={[styles.voiceRecordContainer, theme === 'light' && styles.voiceRecordContainerLight]}>
+                {isRecording ? (
+                  <Animated.View style={[styles.recordingIndicator, { opacity: animationRef }]}>
+                    <Ionicons name="radio-button-on" size={20} color="#FF6B35" />
+                    <Text style={[styles.recordingText, theme === 'light' && styles.recordingTextLight]}>
+                      Recording...
+                    </Text>
+                  </Animated.View>
+                ) : (
+                  <Text style={[styles.voicePrompt, theme === 'light' && styles.voicePromptLight]}>
+                    Hold mic to record voice message
+                  </Text>
+                )}
+              </View>
+            )}
+
+            {conversationMode === 'voice_live' && (
+              <View style={[styles.voiceLiveContainer, theme === 'light' && styles.voiceLiveContainerLight]}>
+                {isListening ? (
+                  <Animated.View style={[styles.listeningIndicator, { opacity: animationRef }]}>
+                    <Ionicons name="radio" size={20} color="#10B981" />
+                    <Text style={[styles.listeningText, theme === 'light' && styles.listeningTextLight]}>
+                      Listening...
+                    </Text>
+                  </Animated.View>
+                ) : (
+                  <Text style={[styles.voicePrompt, theme === 'light' && styles.voicePromptLight]}>
+                    Voice mode ready - speak naturally
+                  </Text>
+                )}
+              </View>
+            )}
 
             <TouchableOpacity 
-              style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
-              onPress={() => {
-                // TODO: Implement voice input functionality
-                console.log('Voice input pressed');
-              }}
-            >
-              <Ionicons
-                name="mic"
-                size={24}
-                color={theme === 'light' ? '#007AFF' : '#ffffff'}
-              />
-            </TouchableOpacity>
-
-            <TouchableOpacity 
-              onPress={loading ? stopStreaming : sendMessage} 
+              onPress={loading ? stopStreaming : () => sendMessage()} 
               style={[
                 styles.sendButton,
-                !input.trim() && !loading && styles.sendButtonDisabled,
+                !input.trim() && !loading && conversationMode === 'text' && styles.sendButtonDisabled,
                 theme === 'light' && styles.sendButtonLight
               ]}
-              disabled={!input.trim() && !loading}
+              disabled={!input.trim() && !loading && conversationMode === 'text'}
             >
               {loading ? (
                 <Ionicons
@@ -745,7 +965,9 @@ export default function App() {
                 <Ionicons
                   name="send"
                   size={24}
-                  color={!input.trim() ? '#999' : '#007AFF'}
+                  color={
+                    (!input.trim() && conversationMode === 'text') ? '#999' : '#007AFF'
+                  }
                 />
               )}
             </TouchableOpacity>
@@ -756,7 +978,6 @@ export default function App() {
             <TouchableOpacity 
               style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
               onPress={() => {
-                // TODO: Implement balance check
                 console.log('Check balance pressed');
               }}
             >
@@ -767,7 +988,6 @@ export default function App() {
             <TouchableOpacity 
               style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
               onPress={() => {
-                // TODO: Implement payment
                 console.log('Payment pressed');
               }}
             >
@@ -778,7 +998,6 @@ export default function App() {
             <TouchableOpacity 
               style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
               onPress={() => {
-                // TODO: Implement transactions
                 console.log('Transactions pressed');
               }}
             >
@@ -789,7 +1008,6 @@ export default function App() {
             <TouchableOpacity 
               style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
               onPress={() => {
-                // TODO: Implement support
                 console.log('Support pressed');
               }}
             >
@@ -811,6 +1029,13 @@ const styles = StyleSheet.create({
   containerLight: {
     backgroundColor: '#ffffff',
   },
+  statusBarSpace: {
+    height: Constants.statusBarHeight,
+    backgroundColor: '#000000',
+  },
+  statusBarSpaceLight: {
+    backgroundColor: '#ffffff',
+  },
   headerContainer: {
     backgroundColor: '#000000',
   },
@@ -827,6 +1052,28 @@ const styles = StyleSheet.create({
   },
   headerLight: {
     backgroundColor: '#ffffff',
+  },
+  modeIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 15,
+    backgroundColor: '#1a1a1a',
+  },
+  modeIndicatorLight: {
+    backgroundColor: '#f8f9fa',
+  },
+  modeText: {
+    marginLeft: 6,
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  pulseDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginLeft: 8,
   },
   headerBorder: {
     height: 1,
@@ -889,9 +1136,6 @@ const styles = StyleSheet.create({
   refreshButtonLight: {
     backgroundColor: '#e1e5e9',
   },
-  keyboardAvoidingView: {
-    flex: 1,
-  },
   content: {
     flex: 1,
   },
@@ -933,6 +1177,9 @@ const styles = StyleSheet.create({
   assistantMessageLight: {
     backgroundColor: '#f5f5f7',
     borderColor: '#e1e5e9',
+  },
+  voiceIndicator: {
+    marginBottom: 4,
   },
   userText: {
     color: '#ffffff',
@@ -979,6 +1226,50 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
     borderTopColor: '#e1e5e9',
   },
+  modeSelector: {
+    flexDirection: 'row',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    backgroundColor: '#1a1a1a',
+    borderBottomWidth: 1,
+    borderBottomColor: '#333333',
+  },
+  modeSelectorLight: {
+    backgroundColor: '#f8f9fa',
+    borderBottomColor: '#e1e5e9',
+  },
+  modeButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    marginHorizontal: 4,
+    backgroundColor: 'transparent',
+  },
+  modeButtonLight: {
+    backgroundColor: 'transparent',
+  },
+  modeButtonActive: {
+    backgroundColor: '#333333',
+  },
+  modeButtonActiveLight: {
+    backgroundColor: '#e1e5e9',
+  },
+  modeButtonText: {
+    marginLeft: 6,
+    fontSize: 14,
+    color: '#999',
+    fontWeight: '500',
+  },
+  modeButtonTextLight: {
+    color: '#666',
+  },
+  modeButtonTextActive: {
+    color: '#007AFF',
+  },
   inputContainer: {
     flexDirection: 'row',
     padding: 10,
@@ -1005,6 +1296,80 @@ const styles = StyleSheet.create({
     backgroundColor: '#f5f5f7',
     color: '#000000',
     borderColor: '#e1e5e9',
+  },
+  voiceRecordContainer: {
+    flex: 1,
+    backgroundColor: '#1c1c1e',
+    borderRadius: 20,
+    paddingHorizontal: 15,
+    paddingVertical: 15,
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: '#333333',
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: 50,
+  },
+  voiceRecordContainerLight: {
+    backgroundColor: '#f5f5f7',
+    borderColor: '#e1e5e9',
+  },
+  voiceLiveContainer: {
+    flex: 1,
+    backgroundColor: '#1c1c1e',
+    borderRadius: 20,
+    paddingHorizontal: 15,
+    paddingVertical: 15,
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: '#333333',
+    justifyContent: 'center',
+    alignItems: 'center',
+    minHeight: 50,
+  },
+  voiceLiveContainerLight: {
+    backgroundColor: '#f5f5f7',
+    borderColor: '#e1e5e9',
+  },
+  recordingIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  recordingText: {
+    marginLeft: 8,
+    color: '#FF6B35',
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  recordingTextLight: {
+    color: '#FF6B35',
+  },
+  listeningIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  listeningText: {
+    marginLeft: 8,
+    color: '#10B981',
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  listeningTextLight: {
+    color: '#10B981',
+  },
+  voicePrompt: {
+    color: '#999',
+    fontSize: 16,
+    textAlign: 'center',
+  },
+  voicePromptLight: {
+    color: '#666',
+  },
+  recordingButton: {
+    backgroundColor: '#FF6B35',
+  },
+  listeningButton: {
+    backgroundColor: '#10B981',
   },
   sendButton: {
     width: 40,
