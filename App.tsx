@@ -11,6 +11,7 @@ import {
   StyleSheet,
   TouchableOpacity,
   Alert,
+  StatusBar,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import Constants from 'expo-constants';
@@ -56,6 +57,7 @@ export default function App() {
   
   const flatListRef = useRef<FlatList>(null);
   const eventSourceRef = useRef<RNEventSource | null>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
   const currentMessageRef = useRef<string>('');
   
   // Authentication state
@@ -68,6 +70,9 @@ export default function App() {
     return () => {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
+      }
+      if (xhrRef.current) {
+        xhrRef.current.abort();
       }
     };
   }, []);
@@ -219,10 +224,14 @@ export default function App() {
 
     await checkTokenExpiry();
 
-    // Close any existing EventSource
+    // Close any existing EventSource or XHR
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
+    }
+    if (xhrRef.current) {
+      xhrRef.current.abort();
+      xhrRef.current = null;
     }
 
     const userMessage: Message = {
@@ -287,6 +296,7 @@ export default function App() {
         
         // Create XHR request
         const xhr = new XMLHttpRequest();
+        xhrRef.current = xhr; // Store reference for stopping
         const url = `${API_BASE_URL}/chat?session_id=${sessionId}`;
         
         xhr.open('POST', url, true);
@@ -314,6 +324,7 @@ export default function App() {
               
               if (data === '[DONE]') {
                 console.log('Stream completed');
+                xhrRef.current = null; // Clear reference
                 xhr.abort();
                 setMessages(prev => prev.map(msg => 
                   msg.id === messageId 
@@ -361,6 +372,7 @@ export default function App() {
         // Handle completion
         xhr.onload = () => {
           console.log('XHR completed with status:', xhr.status);
+          xhrRef.current = null; // Clear reference
           if (xhr.status === 200) {
             // Only complete if we've received actual content
             if (currentMessageRef.current) {
@@ -407,6 +419,7 @@ export default function App() {
         // Handle errors
         xhr.onerror = () => {
           console.error('XHR error occurred');
+          xhrRef.current = null; // Clear reference
           const error = new Error('Network error occurred');
           setMessages(prev => prev.map(msg => 
             msg.id === messageId 
@@ -420,6 +433,23 @@ export default function App() {
           ));
           setLoading(false);
           reject(error);
+        };
+
+        // Handle abort (when user clicks stop)
+        xhr.onabort = () => {
+          console.log('XHR request was aborted by user');
+          xhrRef.current = null; // Clear reference
+          setMessages(prev => prev.map(msg => 
+            msg.id === messageId 
+              ? { 
+                  ...msg, 
+                  content: currentMessageRef.current || 'Request stopped by user.',
+                  isStreaming: false
+                } 
+              : msg
+          ));
+          setLoading(false);
+          resolve(); // Resolve the promise on abort
         };
 
         // Send the request
@@ -449,21 +479,41 @@ export default function App() {
   };
 
   const stopStreaming = () => {
+    console.log('Stopping stream...');
+    
+    // Abort the XHR request if it exists
+    if (xhrRef.current) {
+      console.log('Aborting XHR request');
+      xhrRef.current.abort();
+      xhrRef.current = null;
+    }
+    
+    // Close EventSource if it exists (fallback)
     if (eventSourceRef.current) {
+      console.log('Closing EventSource');
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    
     setLoading(false);
 
     // Mark current streaming message as complete
     setMessages(prev => prev.map(msg => 
-      msg.isStreaming ? { ...msg, isStreaming: false } : msg
+      msg.isStreaming ? { 
+        ...msg, 
+        isStreaming: false,
+        content: msg.content || 'Request stopped by user.'
+      } : msg
     ));
   };
 
   const clearSession = async () => {
     try {
       // Close any active streams
+      if (xhrRef.current) {
+        xhrRef.current.abort();
+        xhrRef.current = null;
+      }
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
@@ -508,8 +558,15 @@ export default function App() {
 
     return (
       <View style={[styles.messageContainer, containerStyle]}>
-        <View style={[styles.messageBubble, messageStyle, theme === 'light' && styles.messageBubbleLight]}>
-          <Text style={[textStyle, theme === 'light' && (isUser ? styles.userTextLight : styles.assistantTextLight)]}>
+        <View style={[
+          styles.messageBubble,
+          messageStyle,
+          theme === 'light' && (isUser ? styles.userMessageLight : styles.assistantMessageLight)
+        ]}>
+          <Text style={[
+            textStyle,
+            theme === 'light' && (isUser ? styles.userTextLight : styles.assistantTextLight)
+          ]}>
             {item.content}
             {item.isStreaming && !item.error && (
               <Text style={styles.typingIndicator}>▋</Text>
@@ -525,20 +582,28 @@ export default function App() {
 
   if (authLoading) {
     return (
-      <SafeAreaView style={[styles.container, theme === 'light' && styles.containerLight]}>
+      <View style={[styles.container, theme === 'light' && styles.containerLight]}>
+        <StatusBar
+          barStyle={theme === 'dark' ? 'light-content' : 'dark-content'}
+          backgroundColor={theme === 'dark' ? '#000000' : '#ffffff'}
+        />
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color="#007AFF" />
           <Text style={[styles.loadingText, theme === 'light' && styles.loadingTextLight]}>
             Connecting to server...
           </Text>
         </View>
-      </SafeAreaView>
+      </View>
     );
   }
 
   if (!isAuthenticated) {
     return (
-      <SafeAreaView style={[styles.container, theme === 'light' && styles.containerLight]}>
+      <View style={[styles.container, theme === 'light' && styles.containerLight]}>
+        <StatusBar
+          barStyle={theme === 'dark' ? 'light-content' : 'dark-content'}
+          backgroundColor={theme === 'dark' ? '#000000' : '#ffffff'}
+        />
         <View style={styles.loadingContainer}>
           <Text style={[styles.errorText, theme === 'light' && styles.errorTextLight]}>
             Authentication Required
@@ -547,53 +612,93 @@ export default function App() {
             <Text style={styles.retryButtonText}>Retry Connection</Text>
           </TouchableOpacity>
         </View>
-      </SafeAreaView>
+      </View>
     );
   }
 
   return (
     <SafeAreaView style={[styles.container, theme === 'light' && styles.containerLight]}>
-      <View style={[styles.header, theme === 'light' && styles.headerLight]}>
-        <Text style={[styles.heading, theme === 'light' && styles.headingLight]}>
-          AI Banking Assistant
-        </Text>
-        <View style={styles.headerButtons}>
-          {loading && (
-            <TouchableOpacity onPress={stopStreaming} style={[styles.stopButton, theme === 'light' && styles.stopButtonLight]}>
-              <Text style={[styles.stopButtonText, theme === 'light' && styles.stopButtonTextLight]}>
-                Stop
-              </Text>
+      <StatusBar
+        barStyle={theme === 'dark' ? 'light-content' : 'dark-content'}
+        backgroundColor={theme === 'dark' ? '#000000' : '#ffffff'}
+      />
+      
+      {/* Header Container with proper separation */}
+      <View style={[styles.headerContainer, theme === 'light' && styles.headerContainerLight]}>
+        <View style={[styles.header, theme === 'light' && styles.headerLight]}>
+          <Text style={[styles.heading, theme === 'light' && styles.headingLight]}>
+            AI Banking Assistant
+          </Text>
+          <View style={styles.headerButtons}>
+            {loading && (
+              <TouchableOpacity onPress={stopStreaming} style={[styles.stopButton, theme === 'light' && styles.stopButtonLight]}>
+                <Text style={[styles.stopButtonText, theme === 'light' && styles.stopButtonTextLight]}>
+                  Stop
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity onPress={toggleTheme} style={[styles.themeButton, theme === 'light' && styles.themeButtonLight]}>
+              <Ionicons name={theme === 'dark' ? 'sunny' : 'moon'} size={20} color={theme === 'dark' ? 'white' : '#333'} />
             </TouchableOpacity>
-          )}
-          <TouchableOpacity onPress={toggleTheme} style={[styles.themeButton, theme === 'light' && styles.themeButtonLight]}>
-            <Ionicons name={theme === 'dark' ? 'sunny' : 'moon'} size={20} color={theme === 'dark' ? 'white' : '#333'} />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={clearSession} style={[styles.refreshButton, theme === 'light' && styles.refreshButtonLight]}>
-            <Ionicons name="refresh" size={20} color={theme === 'dark' ? 'white' : '#333'} />
-          </TouchableOpacity>
+            <TouchableOpacity onPress={clearSession} style={[styles.refreshButton, theme === 'light' && styles.refreshButtonLight]}>
+              <Ionicons name="refresh" size={20} color={theme === 'dark' ? 'white' : '#333'} />
+            </TouchableOpacity>
+          </View>
         </View>
+        
+        {/* Border separator - only at bottom of header */}
+        <View style={[styles.headerBorder, theme === 'light' && styles.headerBorderLight]} />
+      </View>
+      
+      <View style={styles.content}>
+        <FlatList
+          ref={flatListRef}
+          data={messages}
+          renderItem={renderMessage}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.messageList}
+          keyboardDismissMode="interactive"
+          keyboardShouldPersistTaps="handled"
+          onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+          onLayout={() => flatListRef.current?.scrollToEnd({ animated: true })}
+          showsVerticalScrollIndicator={false}
+        />
       </View>
       
       <KeyboardAvoidingView
-        style={styles.keyboardAvoidingView}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 60 : 0}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
       >
-        <View style={styles.content}>
-          <FlatList
-            ref={flatListRef}
-            data={messages}
-            renderItem={renderMessage}
-            keyExtractor={(item) => item.id}
-            contentContainerStyle={styles.messageList}
-            keyboardDismissMode="interactive"
-            keyboardShouldPersistTaps="handled"
-            onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
-            onLayout={() => flatListRef.current?.scrollToEnd({ animated: true })}
-            showsVerticalScrollIndicator={false}
-          />
-          
+        <View style={[styles.bottomContainer, theme === 'light' && styles.bottomContainerLight]}>
           <View style={[styles.inputContainer, theme === 'light' && styles.inputContainerLight]}>
+            <TouchableOpacity 
+              style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
+              onPress={() => {
+                // TODO: Implement attachment functionality
+                console.log('Attachment pressed');
+              }}
+            >
+              <Ionicons
+                name="attach"
+                size={24}
+                color={theme === 'light' ? '#007AFF' : '#ffffff'}
+              />
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
+              onPress={() => {
+                // TODO: Implement emoji picker
+                console.log('Emoji picker pressed');
+              }}
+            >
+              <Ionicons
+                name="happy"
+                size={24}
+                color={theme === 'light' ? '#007AFF' : '#ffffff'}
+              />
+            </TouchableOpacity>
+
             <TextInput
               value={input}
               onChangeText={setInput}
@@ -606,6 +711,21 @@ export default function App() {
               maxLength={1000}
               placeholderTextColor={theme === 'light' ? '#666' : '#999'}
             />
+
+            <TouchableOpacity 
+              style={[styles.iconButton, theme === 'light' && styles.iconButtonLight]}
+              onPress={() => {
+                // TODO: Implement voice input functionality
+                console.log('Voice input pressed');
+              }}
+            >
+              <Ionicons
+                name="mic"
+                size={24}
+                color={theme === 'light' ? '#007AFF' : '#ffffff'}
+              />
+            </TouchableOpacity>
+
             <TouchableOpacity 
               onPress={loading ? stopStreaming : sendMessage} 
               style={[
@@ -630,6 +750,53 @@ export default function App() {
               )}
             </TouchableOpacity>
           </View>
+          
+          {/* Quick Actions */}
+          <View style={[styles.quickActionsContainer, theme === 'light' && styles.quickActionsContainerLight]}>
+            <TouchableOpacity 
+              style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
+              onPress={() => {
+                // TODO: Implement balance check
+                console.log('Check balance pressed');
+              }}
+            >
+              <Ionicons name="wallet" size={24} color={theme === 'light' ? '#007AFF' : '#ffffff'} />
+              <Text style={[styles.quickActionText, theme === 'light' && styles.quickActionTextLight]}>Balance</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
+              onPress={() => {
+                // TODO: Implement payment
+                console.log('Payment pressed');
+              }}
+            >
+              <Ionicons name="card" size={24} color={theme === 'light' ? '#007AFF' : '#ffffff'} />
+              <Text style={[styles.quickActionText, theme === 'light' && styles.quickActionTextLight]}>Pay</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
+              onPress={() => {
+                // TODO: Implement transactions
+                console.log('Transactions pressed');
+              }}
+            >
+              <Ionicons name="stats-chart" size={24} color={theme === 'light' ? '#007AFF' : '#ffffff'} />
+              <Text style={[styles.quickActionText, theme === 'light' && styles.quickActionTextLight]}>Transactions</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={[styles.quickActionButton, theme === 'light' && styles.quickActionButtonLight]}
+              onPress={() => {
+                // TODO: Implement support
+                console.log('Support pressed');
+              }}
+            >
+              <Ionicons name="help-circle" size={24} color={theme === 'light' ? '#007AFF' : '#ffffff'} />
+              <Text style={[styles.quickActionText, theme === 'light' && styles.quickActionTextLight]}>Support</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -644,24 +811,34 @@ const styles = StyleSheet.create({
   containerLight: {
     backgroundColor: '#ffffff',
   },
-  header: {
-    paddingTop: Constants.statusBarHeight,
+  headerContainer: {
     backgroundColor: '#000000',
-    borderBottomWidth: 1,
-    borderBottomColor: '#333333',
+  },
+  headerContainerLight: {
+    backgroundColor: '#ffffff',
+  },
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 15,
+    height: 56,
+    backgroundColor: '#000000',
   },
   headerLight: {
     backgroundColor: '#ffffff',
-    borderBottomColor: '#e1e5e9',
+  },
+  headerBorder: {
+    height: 1,
+    backgroundColor: '#333333',
+    width: '100%',
+  },
+  headerBorderLight: {
+    backgroundColor: '#e1e5e9',
   },
   heading: {
     fontSize: 20,
     fontWeight: '600',
-    paddingVertical: 15,
     color: 'white',
     flex: 1,
   },
@@ -691,17 +868,23 @@ const styles = StyleSheet.create({
     color: '#333',
   },
   themeButton: {
-    padding: 8,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#333333',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   themeButtonLight: {
     backgroundColor: '#e1e5e9',
   },
   refreshButton: {
-    padding: 8,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#333333',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   refreshButtonLight: {
     backgroundColor: '#e1e5e9',
@@ -739,10 +922,17 @@ const styles = StyleSheet.create({
   userMessage: {
     backgroundColor: '#007AFF',
   },
+  userMessageLight: {
+    backgroundColor: '#007AFF',
+  },
   assistantMessage: {
     backgroundColor: '#1c1c1e',
     borderWidth: 1,
     borderColor: '#333333',
+  },
+  assistantMessageLight: {
+    backgroundColor: '#f5f5f7',
+    borderColor: '#e1e5e9',
   },
   userText: {
     color: '#ffffff',
@@ -780,17 +970,23 @@ const styles = StyleSheet.create({
     opacity: 0.7,
     fontWeight: 'bold',
   },
+  bottomContainer: {
+    backgroundColor: '#000000',
+    borderTopWidth: 1,
+    borderTopColor: '#333333',
+  },
+  bottomContainerLight: {
+    backgroundColor: '#ffffff',
+    borderTopColor: '#e1e5e9',
+  },
   inputContainer: {
     flexDirection: 'row',
     padding: 10,
     backgroundColor: '#000000',
-    borderTopWidth: 1,
-    borderTopColor: '#333333',
     alignItems: 'flex-end',
   },
   inputContainerLight: {
     backgroundColor: '#ffffff',
-    borderTopColor: '#e1e5e9',
   },
   textInput: {
     flex: 1,
@@ -851,5 +1047,55 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
     fontWeight: '500',
+  },
+  iconButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#1c1c1e',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginHorizontal: 4,
+    borderWidth: 1,
+    borderColor: '#333333',
+  },
+  iconButtonLight: {
+    backgroundColor: '#f5f5f7',
+    borderColor: '#e1e5e9',
+  },
+  quickActionsContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#333333',
+    backgroundColor: '#000000',
+  },
+  quickActionsContainerLight: {
+    backgroundColor: '#ffffff',
+    borderTopColor: '#e1e5e9',
+  },
+  quickActionButton: {
+    alignItems: 'center',
+    padding: 8,
+    borderRadius: 12,
+    backgroundColor: '#1c1c1e',
+    borderWidth: 1,
+    borderColor: '#333333',
+    minWidth: 80,
+  },
+  quickActionButtonLight: {
+    backgroundColor: '#f5f5f7',
+    borderColor: '#e1e5e9',
+  },
+  quickActionText: {
+    color: '#ffffff',
+    fontSize: 12,
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  quickActionTextLight: {
+    color: '#007AFF',
   },
 });
