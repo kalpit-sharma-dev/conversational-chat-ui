@@ -1,0 +1,570 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  SafeAreaView,
+  TextInput,
+  FlatList,
+  Text,
+  View,
+  KeyboardAvoidingView,
+  Platform,
+  ActivityIndicator,
+  StyleSheet,
+  TouchableOpacity,
+  Keyboard,
+} from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
+
+// Custom SSE implementation for React Native
+class EventSource {
+  private url: string;
+  private controller: AbortController;
+  private onmessage?: (event: { data: string }) => void;
+  private onerror?: (error: Error) => void;
+  private onopen?: () => void;
+  public readyState: number = 0; // CONNECTING = 0, OPEN = 1, CLOSED = 2
+
+  constructor(url: string) {
+    this.url = url;
+    this.controller = new AbortController();
+    this.connect();
+  }
+
+  private async connect() {
+    try {
+      const response = await fetch(this.url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        },
+        signal: this.controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      this.readyState = 1; // OPEN
+      if (this.onopen) this.onopen();
+
+      // For React Native, we need to use response.text() and parse it manually
+      // This is a workaround since RN doesn't support response.body.getReader()
+      const text = await response.text();
+      this.parseSSEData(text);
+
+    } catch (error) {
+      this.readyState = 2; // CLOSED
+      if (this.onerror && error instanceof Error) {
+        this.onerror(error);
+      }
+    }
+  }
+
+  private parseSSEData(text: string) {
+    const lines = text.split('\n');
+    let eventData = '';
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        eventData = line.substring(6); // Remove 'data: ' prefix
+        if (this.onmessage) {
+          this.onmessage({ data: eventData });
+        }
+      }
+    }
+  }
+
+  public close() {
+    this.readyState = 2; // CLOSED
+    this.controller.abort();
+  }
+}
+
+type Message = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  isStreaming?: boolean;
+};
+
+export default function App() {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: '1',
+      role: 'assistant',
+      content: 'Hi! How can I help you with your banking today?',
+    },
+  ]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const flatListRef = useRef<FlatList>(null);
+  const streamingRef = useRef(false);
+  const currentStreamingIdRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    flatListRef.current?.scrollToEnd({ animated: true });
+  }, [messages]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading) return;
+
+    // Cancel any ongoing stream
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: input,
+    };
+
+    const currentInput = input;
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setLoading(true);
+
+    const assistantMessageId = Date.now().toString() + '-ai';
+    currentStreamingIdRef.current = assistantMessageId;
+    
+    // Add empty assistant message for streaming
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: '',
+        isStreaming: true,
+      },
+    ]);
+    streamingRef.current = true;
+
+    // Create new AbortController for this request
+    abortControllerRef.current = new AbortController();
+
+    try {
+      console.log('Starting streamWithXHR streaming...');
+      // await streamWithSSE(currentInput, assistantMessageId);
+      await streamWithXHR(currentInput, assistantMessageId);
+
+    } catch (err) {
+      console.error("SSE Streaming error:", err);
+      
+      // Don't show error if request was aborted intentionally
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log('Request was aborted');
+        return;
+      }
+      
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantMessageId 
+          ? { 
+              ...msg, 
+              content: `Sorry, I encountered an error: ${err instanceof Error ? err.message : 'Unknown error'}. Please check if the server is running and accessible.`,
+              isStreaming: false 
+            } 
+          : msg
+      ));
+    } finally {
+      setLoading(false);
+      streamingRef.current = false;
+      currentStreamingIdRef.current = null;
+      abortControllerRef.current = null;
+    }
+  };
+
+  const streamWithSSE = async (message: string, messageId: string) => {
+    return new Promise<void>((resolve, reject) => {
+      // Create POST request to start SSE stream
+      const startSSEStream = async () => {
+        try {
+          const response = await fetch('http://192.168.0.186:8080/chat', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'text/event-stream',
+            },
+            body: JSON.stringify({ message }),
+            signal: abortControllerRef.current?.signal,
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! Status: ${response.status}`);
+          }
+
+          // Get the response as text and parse it
+          const responseText = await response.text();
+          console.log('Raw SSE response:', responseText);
+
+          // Parse SSE events from the response
+          const events = responseText.split('\n\n').filter(event => event.trim());
+          
+          for (const event of events) {
+            if (!streamingRef.current || currentStreamingIdRef.current !== messageId) {
+              break;
+            }
+
+            const lines = event.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.substring(6); // Remove 'data: ' prefix
+                
+                // Check for error messages
+                if (data.startsWith('Error:') || data === 'Request timeout') {
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === messageId 
+                      ? { ...msg, content: data, isStreaming: false } 
+                      : msg
+                  ));
+                  reject(new Error(data));
+                  return;
+                }
+
+                // Add the token to the message
+                setMessages(prev => prev.map(msg => 
+                  msg.id === messageId 
+                    ? { ...msg, content: msg.content + data } 
+                    : msg
+                ));
+
+                console.log('Received SSE token:', data);
+                
+                // Add a small delay to simulate real-time streaming
+                await new Promise(resolve => setTimeout(resolve, 10));
+              }
+            }
+          }
+
+          // Mark as complete
+          setMessages(prev => prev.map(msg => 
+            msg.id === messageId 
+              ? { ...msg, isStreaming: false } 
+              : msg
+          ));
+          
+          resolve();
+
+        } catch (error) {
+          console.error('SSE stream error:', error);
+          reject(error);
+        }
+      };
+
+      startSSEStream();
+    });
+  };
+
+  // Alternative approach using XMLHttpRequest for better streaming support
+  const streamWithXHR = async (message: string, messageId: string) => {
+    return new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      let lastProcessedIndex = 0;
+
+      xhr.open('POST', 'http://192.168.0.186:8080/chat', true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.setRequestHeader('Accept', 'text/event-stream');
+
+      xhr.onprogress = () => {
+        if (!streamingRef.current || currentStreamingIdRef.current !== messageId) {
+          xhr.abort();
+          return;
+        }
+
+        const newData = xhr.responseText.substring(lastProcessedIndex);
+        lastProcessedIndex = xhr.responseText.length;
+
+        // Process new SSE data
+        const lines = newData.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.substring(6);
+            
+            if (data.trim()) {
+              // Check for error messages
+              if (data.startsWith('Error:') || data === 'Request timeout') {
+                setMessages(prev => prev.map(msg => 
+                  msg.id === messageId 
+                    ? { ...msg, content: data, isStreaming: false } 
+                    : msg
+                ));
+                reject(new Error(data));
+                return;
+              }
+
+              // Add token to message
+              setMessages(prev => prev.map(msg => 
+                msg.id === messageId 
+                  ? { ...msg, content: msg.content + data } 
+                  : msg
+              ));
+
+              console.log('XHR SSE token:', data);
+            }
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        console.log('XHR stream completed');
+        setMessages(prev => prev.map(msg => 
+          msg.id === messageId 
+            ? { ...msg, isStreaming: false } 
+            : msg
+        ));
+        resolve();
+      };
+
+      xhr.onerror = () => {
+        console.error('XHR error');
+        reject(new Error('XHR request failed'));
+      };
+
+      xhr.send(JSON.stringify({ message }));
+
+      // Store XHR reference for cancellation
+      abortControllerRef.current = {
+        abort: () => xhr.abort(),
+        signal: null as any
+      } as AbortController;
+    });
+  };
+
+  const stopStreaming = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    streamingRef.current = false;
+    currentStreamingIdRef.current = null;
+    setLoading(false);
+
+    // Mark current streaming message as complete
+    setMessages(prev => prev.map(msg => 
+      msg.isStreaming ? { ...msg, isStreaming: false } : msg
+    ));
+  };
+
+  const renderItem = ({ item }: { item: Message }) => (
+    <View
+      style={[
+        styles.messageContainer,
+        item.role === 'user' ? styles.userMessage : styles.aiMessage,
+      ]}
+    >
+      <Text style={[
+        styles.messageText,
+        item.role === 'user' && styles.userMessageText
+      ]}>
+        {item.content}
+        {item.isStreaming && (
+          <Text style={styles.typingIndicator}>
+            <Text style={styles.cursor}>|</Text>
+          </Text>
+        )}
+      </Text>
+    </View>
+  );
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.heading}>AI Banking Assistant</Text>
+        {loading && (
+          <TouchableOpacity onPress={stopStreaming} style={styles.stopButton}>
+            <Text style={styles.stopButtonText}>Stop</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      
+      <KeyboardAvoidingView
+        style={styles.keyboardAvoidingView}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 60 : 0}
+      >
+        <View style={styles.content}>
+          <FlatList
+            ref={flatListRef}
+            data={messages}
+            renderItem={renderItem}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.messageList}
+            keyboardDismissMode="interactive"
+            keyboardShouldPersistTaps="handled"
+            automaticallyAdjustContentInsets={false}
+            onContentSizeChange={() => 
+              setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100)
+            }
+            onLayout={() => 
+              setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100)
+            }
+          />
+          
+          <View style={styles.inputContainer}>
+            <TextInput
+              value={input}
+              onChangeText={setInput}
+              placeholder="Ask about your banking needs..."
+              style={styles.textInput}
+              editable={!loading}
+              returnKeyType="send"
+              onSubmitEditing={sendMessage}
+              multiline={false}
+            />
+            <TouchableOpacity 
+              onPress={loading ? stopStreaming : sendMessage} 
+              style={[
+                styles.sendButton,
+                !input.trim() && !loading && styles.sendButtonDisabled
+              ]}
+            >
+              {loading ? (
+                <Ionicons
+                  name="stop"
+                  size={24}
+                  color="#FF3B30"
+                />
+              ) : (
+                <Ionicons
+                  name="send"
+                  size={24}
+                  color={!input.trim() ? '#999' : '#007AFF'}
+                />
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#f8f9fa',
+  },
+  header: {
+    paddingTop: Constants.statusBarHeight,
+    backgroundColor: '#007AFF',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  heading: {
+    fontSize: 20,
+    fontWeight: '600',
+    paddingHorizontal: 15,
+    paddingVertical: 15,
+    textAlign: 'center',
+    color: 'white',
+    flex: 1,
+  },
+  stopButton: {
+    position: 'absolute',
+    right: 15,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 15,
+  },
+  stopButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  keyboardAvoidingView: {
+    flex: 1,
+  },
+  content: {
+    flex: 1,
+    justifyContent: 'space-between',
+  },
+  messageList: {
+    flexGrow: 1,
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+  },
+  messageContainer: {
+    borderRadius: 18,
+    marginVertical: 3,
+    padding: 12,
+    maxWidth: '85%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
+  },
+  userMessage: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#007AFF',
+  },
+  aiMessage: {
+    alignSelf: 'flex-start',
+    backgroundColor: 'white',
+    borderWidth: 1,
+    borderColor: '#e1e5e9',
+  },
+  messageText: {
+    fontSize: 16,
+    lineHeight: 22,
+    color: '#333',
+  },
+  userMessageText: {
+    color: 'white',
+  },
+  typingIndicator: {
+    marginLeft: 2,
+  },
+  cursor: {
+    color: '#007AFF',
+    fontWeight: 'bold',
+    fontSize: 18,
+  },
+  inputContainer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderTopColor: '#e1e5e9',
+    borderTopWidth: 1,
+    backgroundColor: 'white',
+    paddingBottom: Platform.OS === 'ios' ? 10 : 15,
+  },
+  textInput: {
+    flex: 1,
+    borderColor: '#e1e5e9',
+    borderWidth: 1,
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    fontSize: 16,
+    backgroundColor: '#f8f9fa',
+    marginRight: 10,
+    maxHeight: 100,
+    minHeight: 44,
+  },
+  sendButton: {
+    padding: 12,
+    borderRadius: 22,
+    backgroundColor: '#f0f0f0',
+  },
+  sendButtonDisabled: {
+    opacity: 0.5,
+  },
+});
